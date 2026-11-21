@@ -347,6 +347,55 @@ for (m in unique(acc_cells$model)) {
 }
 ```
 
+## Accuracy by condition
+
+Same layout as "Gain by condition", but showing the change in accuracy
+(percentage points). Error bars are ±1 SE across seeds. Labels under each bar
+show accuracy before → after fine-tuning.
+
+```{r acc-condition-data}
+acc_by_condition <- scores |>
+  group_by(model, seed, source, target, condition) |>
+  summarise(acc_base = mean(base_score > 0), acc_after = mean(score > 0),
+            .groups = "drop") |>
+  mutate(delta = 100 * (acc_after - acc_base)) |>
+  group_by(model, source, target, condition) |>
+  summarise(mean = mean(delta), se = sd(delta) / sqrt(n()),
+            acc_base = mean(acc_base), acc_after = mean(acc_after),
+            .groups = "drop") |>
+  mutate(se = replace_na(se, 0),
+         label = sprintf("%.0f→%.0f", 100 * acc_base, 100 * acc_after))
+
+plot_acc_condition <- function(d, title) {
+  ggplot(d, aes(x = condition, y = mean, fill = condition)) +
+    geom_hline(yintercept = 0, color = "grey50") +
+    geom_col(width = 0.7) +
+    geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.2) +
+    geom_text(aes(y = -100, label = label), size = 2.8, vjust = 0) +
+    scale_fill_manual(values = condition_colors, guide = "none") +
+    scale_y_continuous(limits = c(-100, 100)) +
+    facet_grid(source ~ target, scales = "free_x",
+               labeller = labeller(source = \(x) paste("Train:", x),
+                                   target = \(x) paste("Test:", x))) +
+    labs(x = NULL, y = "Δ accuracy (pp)", title = title) +
+    theme_bw(base_size = 11) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1))
+}
+```
+
+```{r acc-condition-plots, results = "asis", fig.width = 11, fig.height = 7}
+for (m in unique(acc_by_condition$model)) {
+  cat("\n\n### ", m, "\n\n")
+  p <- plot_acc_condition(filter(acc_by_condition, model == m), m)
+  print(p)
+  if (isTRUE(params$save_png)) {
+    ggsave(file.path("figures", paste0("acc_condition_", safe_name(m), ".png")), p,
+           width = 11, height = 7, dpi = 300, bg = "white")
+  }
+  cat("\n\n")
+}
+```
+
 ## Explicit vs. implicit probe
 
 Mean gain on fb and antagonist, split by how the final question is worded
