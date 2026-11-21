@@ -1,0 +1,444 @@
+---
+title: "Developmental ToM: cross-task fine-tuning transfer"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+params:
+  results_dir: "data/processed/finetune"   # one subfolder per model, then per revision
+  source_order: !r c("fb", "antagonist", "attn_agent")
+  target_order: !r c("fb", "antagonist", "attn_agent", "attn_loc")
+  use_log2: false                          # true = report log-odds in base 2
+  save_png: true                           # also save each figure to figures/
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 6.5, fig.height = 5)
+library(tidyverse)
+```
+
+Each cell is the mean change in log-odds of the correct answer on the **test task**
+(columns) after fine-tuning on the **train task** (rows), relative to the base
+model. Every cell is scored on held-out stories (4-fold CV over stories), so each
+item is tested once per seed. Values are averaged over items, then over seeds.
+Outlined cells are within-task. `attn_loc` (location attention checks) is
+evaluated but never trained on.
+
+Correct answers: **fb** = the protagonist's belief (start location for False
+Belief, end location for True Belief); **antagonist** = end location in both
+conditions (the antagonist moved the object); **attn_agent** = the person who
+placed / moved the object; **attn_loc** = the start / end location.
+
+```{r load}
+# Look for the results folder from the working directory, then one or two
+# levels up (e.g. if this Rmd lives in analysis/).
+results_dir <- params$results_dir
+for (prefix in c(".", "..", "../..")) {
+  if (dir.exists(file.path(prefix, params$results_dir))) {
+    results_dir <- file.path(prefix, params$results_dir)
+    break
+  }
+}
+if (!dir.exists(results_dir)) {
+  stop("Can't find the results folder '", params$results_dir, "'. ",
+       "This Rmd is looking in: ", normalizePath("."),
+       ". Set results_dir in the header to the full path of your results folder.")
+}
+
+# data/processed/finetune/<model>/<revision>/ft_*.csv
+run_dirs <- list.dirs(results_dir, recursive = TRUE)
+run_dirs <- run_dirs[map_lgl(run_dirs, \(d)
+  length(list.files(d, pattern = "^ft_.*\\.csv$")) > 0)]
+if (length(run_dirs) == 0) {
+  stop("No ft_*.csv files found under ", normalizePath(results_dir))
+}
+
+read_run <- function(dir) {
+  files <- list.files(dir, pattern = "^ft_.*\\.csv$", full.names = TRUE)
+  revision <- basename(dir)
+  model <- basename(dirname(dir))
+  map_dfr(files, \(f) read_csv(f, show_col_types = FALSE,
+                               col_types = cols(question_id = col_double(),
+                                                .default = col_guess()))) |>
+    select(-any_of(c("model", "revision"))) |>
+    mutate(model = paste0(model, " @ ", if_else(revision == "main", "final", revision)))
+}
+
+log_scale <- if (isTRUE(params$use_log2)) log(2) else 1
+units <- if (isTRUE(params$use_log2)) "log2" else "natural log"
+
+question_labels <- c(`1` = "Original location", `2` = "Final location",
+                     `3` = "Who placed", `4` = "Who moved")
+
+scores <- map_dfr(run_dirs, read_run) |>
+  rename(target = task) |>
+  mutate(
+    score = score / log_scale,
+    base_score = base_score / log_scale,
+    gain = score - base_score,
+    passage = condition,                     # FB vs. TB story, for every task
+    # For the attention checks, "condition" is the question type
+    condition = if_else(is.na(question_id), condition,
+                        unname(question_labels[as.character(question_id)])),
+    source = factor(source, levels = params$source_order),
+    target = factor(target, levels = params$target_order)
+  ) |>
+  filter(!is.na(source), !is.na(target))
+
+condition_levels <- c("False Belief", "True Belief", unname(question_labels))
+scores <- mutate(scores, condition = factor(condition, levels = condition_levels))
+
+# Per-item values averaged over seeds (used by the item-level plots)
+items <- scores |>
+  group_by(model, source, target, item_id, question_id, condition, passage) |>
+  summarise(base = mean(base_score), after = mean(score),
+            gain = mean(gain), n_seeds = n(), .groups = "drop")
+```
+
+```{r summarise}
+# Mean gain per seed, then mean and SE across seeds
+per_seed <- scores |>
+  group_by(model, seed, source, target) |>
+  summarise(gain = mean(gain, na.rm = TRUE), n_folds = n_distinct(fold),
+            .groups = "drop")
+
+cells <- per_seed |>
+  group_by(model, source, target) |>
+  summarise(mean = mean(gain), sd = sd(gain), n_seeds = n(),
+            min_folds = min(n_folds), .groups = "drop") |>
+  mutate(se = sd / sqrt(n_seeds))
+```
+
+## Runs found
+
+```{r runs}
+scores |>
+  distinct(model, source, seed, fold) |>
+  group_by(model, source) |>
+  summarise(Seeds = paste(sort(unique(seed)), collapse = ", "),
+            `Folds per seed` = paste(sort(unique(fold)), collapse = ", "),
+            .groups = "drop") |>
+  rename(Model = model, `Train task` = source) |>
+  knitr::kable()
+```
+
+Log-odds units: `r units`. If a run is incomplete (not all 4 folds), a cell only
+covers some stories, so compare cells with care.
+
+```{r plot-fn}
+plot_matrix <- function(d, title) {
+  lim <- max(abs(d$mean), na.rm = TRUE)
+  diag <- filter(d, as.character(source) == as.character(target))
+  seeds <- range(d$n_seeds)
+  subtitle <- paste0(
+    if (seeds[1] == seeds[2]) paste0(seeds[1], " seed(s)") else
+      paste0(seeds[1], "-", seeds[2], " seeds per cell"),
+    if (min(d$min_folds) < 4) " (some folds missing)" else "")
+
+  ggplot(d, aes(x = target, y = fct_rev(source), fill = mean)) +
+    geom_tile(color = "white", linewidth = 0.5) +
+    geom_tile(data = diag, fill = NA, color = "black", linewidth = 0.9) +
+    geom_text(aes(label = sprintf("%.2f", mean),
+                  color = abs(mean) > 0.6 * lim), size = 4) +
+    scale_color_manual(values = c(`TRUE` = "white", `FALSE` = "black"),
+                       guide = "none") +
+    scale_fill_gradient2(low = "#B2182B", mid = "#F7F7F7", high = "#2166AC",
+                         midpoint = 0, limits = c(-lim, lim),
+                         name = "Δ log-odds\ncorrect") +
+    labs(x = "Test task", y = "Train task", title = title, subtitle = subtitle) +
+    coord_fixed() +
+    theme_minimal(base_size = 12) +
+    theme(panel.grid = element_blank())
+}
+
+safe_name <- function(m) str_replace_all(m, "[^A-Za-z0-9._-]+", "_")
+if (isTRUE(params$save_png)) dir.create("figures", showWarnings = FALSE)
+```
+
+## Heatmaps by model
+
+```{r heatmaps, results = "asis"}
+for (m in unique(cells$model)) {
+  cat("\n\n### ", m, "\n\n")
+  p <- plot_matrix(filter(cells, model == m), m)
+  print(p)
+  if (isTRUE(params$save_png)) {
+    ggsave(file.path("figures", paste0("transfer_", safe_name(m), ".png")), p,
+           width = 6.5, height = 5, dpi = 300, bg = "white")
+  }
+  cat("\n\n")
+}
+```
+
+## All models together
+
+Shared color scale, so cells can be compared across models and checkpoints.
+
+```{r all-models, fig.width = 10, fig.height = 5}
+lim_all <- max(abs(cells$mean), na.rm = TRUE)
+diag_all <- filter(cells, as.character(source) == as.character(target))
+
+p_all <- ggplot(cells, aes(x = target, y = fct_rev(source), fill = mean)) +
+  geom_tile(color = "white", linewidth = 0.4) +
+  geom_tile(data = diag_all, fill = NA, color = "black", linewidth = 0.7) +
+  geom_text(aes(label = sprintf("%.1f", mean)), size = 2.8) +
+  scale_fill_gradient2(low = "#B2182B", mid = "#F7F7F7", high = "#2166AC",
+                       midpoint = 0, limits = c(-lim_all, lim_all),
+                       name = "Δ log-odds\ncorrect") +
+  facet_wrap(~ model) +
+  labs(x = "Test task", y = "Train task") +
+  coord_fixed() +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+p_all
+if (isTRUE(params$save_png)) {
+  ggsave(file.path("figures", "transfer_all_models.png"), p_all,
+         width = 10, height = 5, dpi = 300, bg = "white")
+}
+```
+
+## Gain by condition
+
+Mean gain for each condition of each test task (fb and antagonist: False vs.
+True Belief; attention checks: question type). Error bars are ±1 SE across
+seeds. Orange marks answers that match the protagonist's outdated view (False
+Belief, original location); green marks answers that match current reality
+(True Belief, final location).
+
+How to read a shift toward one location:
+
+- **fb**: a general shift toward the end location shows up as False Belief
+  down and True Belief up. If both go up, the change depends on the condition.
+- **antagonist**: the correct answer is the end location in *both* conditions,
+  so a general shift toward the end location makes both go up. Compare with
+  fb to tell real agent tracking apart from that shift.
+
+```{r condition-fn}
+by_condition <- scores |>
+  group_by(model, seed, source, target, condition) |>
+  summarise(gain = mean(gain), .groups = "drop") |>
+  group_by(model, source, target, condition) |>
+  summarise(mean = mean(gain), se = sd(gain) / sqrt(n()), n_seeds = n(),
+            .groups = "drop") |>
+  mutate(se = replace_na(se, 0))
+
+condition_colors <- c("False Belief" = "#D95F02", "True Belief" = "#1B9E77",
+                      "Original location" = "#D95F02", "Final location" = "#1B9E77",
+                      "Who placed" = "#7570B3", "Who moved" = "#999999")
+
+plot_condition <- function(d, title) {
+  ggplot(d, aes(x = condition, y = mean, fill = condition)) +
+    geom_hline(yintercept = 0, color = "grey50") +
+    geom_col(width = 0.7) +
+    geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.2) +
+    scale_fill_manual(values = condition_colors, guide = "none") +
+    facet_grid(source ~ target, scales = "free_x",
+               labeller = labeller(source = \(x) paste("Train:", x),
+                                   target = \(x) paste("Test:", x))) +
+    labs(x = NULL, y = "Δ log-odds correct", title = title) +
+    theme_bw(base_size = 11) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1))
+}
+```
+
+```{r condition-plots, results = "asis", fig.width = 11, fig.height = 7}
+for (m in unique(by_condition$model)) {
+  cat("\n\n### ", m, "\n\n")
+  p <- plot_condition(filter(by_condition, model == m), m)
+  print(p)
+  if (isTRUE(params$save_png)) {
+    ggsave(file.path("figures", paste0("condition_", safe_name(m), ".png")), p,
+           width = 11, height = 7, dpi = 300, bg = "white")
+  }
+  cat("\n\n")
+}
+```
+
+## Attention checks by passage type
+
+Gain on each attention-check question, split by whether it was asked about a
+False Belief or a True Belief passage. If a fine-tuned model answers based on
+the type of story rather than the question, it should favor the original
+location (and the person who placed the object) on False Belief passages, and
+the final location (and the person who moved it) on True Belief passages,
+whatever the question asks.
+
+```{r attn-passage}
+attn_sum <- scores |>
+  filter(target %in% c("attn_agent", "attn_loc")) |>
+  mutate(passage = paste(passage, "passage")) |>
+  group_by(model, seed, source, condition, passage) |>
+  summarise(gain = mean(gain), .groups = "drop") |>
+  group_by(model, source, condition, passage) |>
+  summarise(mean = mean(gain), se = sd(gain) / sqrt(n()), .groups = "drop") |>
+  mutate(se = replace_na(se, 0))
+```
+
+```{r attn-passage-plots, results = "asis", fig.width = 9, fig.height = 7}
+for (m in unique(attn_sum$model)) {
+  cat("\n\n### ", m, "\n\n")
+  p <- filter(attn_sum, model == m) |>
+    ggplot(aes(x = condition, y = mean, fill = passage)) +
+    geom_hline(yintercept = 0, color = "grey50") +
+    geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+    geom_errorbar(aes(ymin = mean - se, ymax = mean + se),
+                  position = position_dodge(width = 0.8), width = 0.2) +
+    scale_fill_manual(values = c("False Belief passage" = "#D95F02",
+                                 "True Belief passage" = "#1B9E77"), name = NULL) +
+    facet_wrap(~ source, ncol = 1, labeller = labeller(source = \(x) paste("Train:", x))) +
+    labs(x = "Attention-check question", y = "Δ log-odds correct", title = m) +
+    theme_bw(base_size = 11) +
+    theme(legend.position = "bottom")
+  print(p)
+  if (isTRUE(params$save_png)) {
+    ggsave(file.path("figures", paste0("attn_passage_", safe_name(m), ".png")), p,
+           width = 9, height = 7, dpi = 300, bg = "white")
+  }
+  cat("\n\n")
+}
+```
+
+## Accuracy
+
+Change in accuracy (percentage points), where an item counts as correct if the
+model gives the correct answer higher probability than the incorrect one.
+Labels show accuracy before → after fine-tuning.
+
+```{r accuracy-data}
+acc_cells <- scores |>
+  group_by(model, seed, source, target) |>
+  summarise(acc_base = mean(base_score > 0), acc_after = mean(score > 0),
+            .groups = "drop") |>
+  group_by(model, source, target) |>
+  summarise(acc_base = mean(acc_base), acc_after = mean(acc_after),
+            .groups = "drop") |>
+  mutate(delta = 100 * (acc_after - acc_base),
+         label = sprintf("%+.0f\n(%.0f→%.0f)", delta, 100 * acc_base, 100 * acc_after))
+
+plot_accuracy <- function(d, title) {
+  lim <- max(abs(d$delta), 1, na.rm = TRUE)
+  diag <- filter(d, as.character(source) == as.character(target))
+  ggplot(d, aes(x = target, y = fct_rev(source), fill = delta)) +
+    geom_tile(color = "white", linewidth = 0.5) +
+    geom_tile(data = diag, fill = NA, color = "black", linewidth = 0.9) +
+    geom_text(aes(label = label), size = 3.3, lineheight = 0.9) +
+    scale_fill_gradient2(low = "#B2182B", mid = "#F7F7F7", high = "#2166AC",
+                         midpoint = 0, limits = c(-lim, lim),
+                         name = "Δ accuracy\n(pp)") +
+    labs(x = "Test task", y = "Train task", title = title) +
+    coord_fixed() +
+    theme_minimal(base_size = 12) +
+    theme(panel.grid = element_blank())
+}
+```
+
+```{r accuracy-plots, results = "asis"}
+for (m in unique(acc_cells$model)) {
+  cat("\n\n### ", m, "\n\n")
+  p <- plot_accuracy(filter(acc_cells, model == m), m)
+  print(p)
+  if (isTRUE(params$save_png)) {
+    ggsave(file.path("figures", paste0("accuracy_", safe_name(m), ".png")), p,
+           width = 6.5, height = 5, dpi = 300, bg = "white")
+  }
+  cat("\n\n")
+}
+```
+
+## Explicit vs. implicit probe
+
+Mean gain on fb and antagonist, split by how the final question is worded
+(explicit "thinks the X is in the" vs. implicit, e.g. "goes to get the X from
+the"). Error bars are ±1 SE across seeds.
+
+```{r cue-data}
+by_cue <- scores |>
+  filter(target %in% c("fb", "antagonist")) |>
+  group_by(model, seed, source, target, condition, knowledge_cue) |>
+  summarise(gain = mean(gain), .groups = "drop") |>
+  group_by(model, source, target, condition, knowledge_cue) |>
+  summarise(mean = mean(gain), se = sd(gain) / sqrt(n()), .groups = "drop") |>
+  mutate(se = replace_na(se, 0))
+
+plot_cue <- function(d, title) {
+  ggplot(d, aes(x = knowledge_cue, y = mean, fill = condition)) +
+    geom_hline(yintercept = 0, color = "grey50") +
+    geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+    geom_errorbar(aes(ymin = mean - se, ymax = mean + se),
+                  position = position_dodge(width = 0.8), width = 0.2) +
+    scale_fill_manual(values = condition_colors, name = NULL) +
+    facet_grid(source ~ target,
+               labeller = labeller(source = \(x) paste("Train:", x),
+                                   target = \(x) paste("Test:", x))) +
+    labs(x = NULL, y = "Δ log-odds correct", title = title) +
+    theme_bw(base_size = 11) +
+    theme(legend.position = "bottom")
+}
+```
+
+```{r cue-plots, results = "asis", fig.width = 7, fig.height = 7}
+for (m in unique(by_cue$model)) {
+  cat("\n\n### ", m, "\n\n")
+  p <- plot_cue(filter(by_cue, model == m), m)
+  print(p)
+  if (isTRUE(params$save_png)) {
+    ggsave(file.path("figures", paste0("cue_", safe_name(m), ".png")), p,
+           width = 7, height = 7, dpi = 300, bg = "white")
+  }
+  cat("\n\n")
+}
+```
+
+## Item-level: before vs. after
+
+Each point is one item (averaged over seeds): log-odds of the correct answer
+for the base model (x) and after fine-tuning (y). Points above the diagonal
+improved; points right of the vertical line were already correct before
+fine-tuning, and points above the horizontal line are correct after.
+
+```{r item-fn}
+plot_items <- function(d, title) {
+  ggplot(d, aes(x = base, y = after, color = condition)) +
+    geom_hline(yintercept = 0, color = "grey70") +
+    geom_vline(xintercept = 0, color = "grey70") +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
+    geom_point(alpha = 0.7, size = 1.6) +
+    scale_color_manual(values = condition_colors, name = "Condition") +
+    facet_grid(source ~ target,
+               labeller = labeller(source = \(x) paste("Train:", x),
+                                   target = \(x) paste("Test:", x))) +
+    labs(x = "Base model log-odds", y = "Fine-tuned log-odds", title = title) +
+    theme_bw(base_size = 11) +
+    theme(legend.position = "bottom")
+}
+```
+
+```{r item-plots, results = "asis", fig.width = 11, fig.height = 8}
+for (m in unique(items$model)) {
+  cat("\n\n### ", m, "\n\n")
+  p <- plot_items(filter(items, model == m), m)
+  print(p)
+  if (isTRUE(params$save_png)) {
+    ggsave(file.path("figures", paste0("items_", safe_name(m), ".png")), p,
+           width = 11, height = 8, dpi = 300, bg = "white")
+  }
+  cat("\n\n")
+}
+```
+
+## Table: mean (SE across seeds)
+
+```{r table}
+cells |>
+  mutate(value = if_else(n_seeds > 1,
+                         sprintf("%.2f (%.2f)", mean, se),
+                         sprintf("%.2f", mean))) |>
+  select(model, source, target, value) |>
+  arrange(target) |>
+  pivot_wider(names_from = target, values_from = value) |>
+  arrange(model, source) |>
+  rename(Model = model, `Train task` = source) |>
+  knitr::kable()
+```
