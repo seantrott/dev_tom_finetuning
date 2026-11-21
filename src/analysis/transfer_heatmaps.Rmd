@@ -396,6 +396,120 @@ for (m in unique(acc_by_condition$model)) {
 }
 ```
 
+## Accuracy change across training stages
+
+One figure per test task. Each line is the change in accuracy (percentage
+points) on that test task after fine-tuning on the row's training task, at
+each training stage. Columns are model sizes. Error bars are ±1 SE across
+seeds. Stages: Stage 1 (last stage-1 checkpoint), Stage 2 (last stage-2
+checkpoint), Pretrained (final base model), then the SFT, DPO and Instruct
+models.
+
+```{r stage-data}
+stage_levels <- c("Stage 1", "Stage 2", "Pretrained", "SFT", "DPO", "Instruct")
+
+acc_by_stage <- acc_by_condition |>
+  mutate(
+    model_name = str_remove(model, " @ .*$"),
+    revision = str_remove(model, "^.* @ "),
+    size = str_extract(model_name, "\\d+B"),
+    stage = case_when(
+      str_detect(model_name, "-Instruct$") ~ "Instruct",
+      str_detect(model_name, "-DPO$") ~ "DPO",
+      str_detect(model_name, "-SFT$") ~ "SFT",
+      str_detect(revision, "^stage1") ~ "Stage 1",
+      str_detect(revision, "^stage2") ~ "Stage 2",
+      revision == "final" ~ "Pretrained",
+      TRUE ~ NA_character_
+    )
+  ) |>
+  filter(!is.na(stage), !is.na(size)) |>
+  mutate(stage = factor(stage, levels = stage_levels),
+         size = factor(size, levels = str_sort(unique(size), numeric = TRUE)))
+
+plot_stage <- function(d, title) {
+  ggplot(d, aes(x = stage, y = mean, color = condition, group = condition)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+    geom_line(linewidth = 0.7) +
+    geom_point(size = 2) +
+    geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.15) +
+    scale_color_manual(values = condition_colors, name = "Condition") +
+    scale_y_continuous(limits = c(-100, 100)) +
+    facet_grid(source ~ size,
+               labeller = labeller(source = \(x) paste("Train:", x))) +
+    labs(x = "Training stage", y = "Δ accuracy (pp)", title = title) +
+    theme_minimal(base_size = 11) +
+    theme(axis.text.x = element_text(angle = 35, hjust = 1),
+          legend.position = "bottom",
+          strip.text = element_text(face = "bold"))
+}
+```
+
+```{r stage-plots, results = "asis", fig.width = 9, fig.height = 8}
+if (nrow(acc_by_stage) == 0) {
+  cat("No runs with recognizable training stages found.")
+}
+for (t in levels(droplevels(acc_by_stage$target))) {
+  cat("\n\n### Test: ", t, "\n\n")
+  p <- plot_stage(filter(acc_by_stage, target == t), paste("Test:", t))
+  print(p)
+  if (isTRUE(params$save_png)) {
+    ggsave(file.path("figures", paste0("stages_test_", t, ".png")), p,
+           width = 9, height = 8, dpi = 300, bg = "white")
+  }
+  cat("\n\n")
+}
+```
+
+## Accuracy before and after fine-tuning, across stages
+
+Same layout as above, but showing accuracy itself rather than the change:
+dashed lines are the base model, solid lines are after fine-tuning. This makes
+ceiling and floor effects visible (a condition already near 100% has little
+room to improve).
+
+```{r stage-ba-data}
+acc_stage_ba <- acc_by_stage |>
+  select(size, stage, source, target, condition, acc_base, acc_after) |>
+  pivot_longer(c(acc_base, acc_after), names_to = "phase", values_to = "acc") |>
+  mutate(acc = 100 * acc,
+         phase = factor(recode(phase, acc_base = "Base", acc_after = "Fine-tuned"),
+                        levels = c("Base", "Fine-tuned")))
+
+plot_stage_ba <- function(d, title) {
+  ggplot(d, aes(x = stage, y = acc, color = condition, linetype = phase,
+                group = interaction(condition, phase))) +
+    geom_hline(yintercept = 50, linetype = "dotted", color = "grey50") +
+    geom_line(linewidth = 0.7) +
+    geom_point(aes(shape = phase), size = 2) +
+    scale_color_manual(values = condition_colors, name = "Condition") +
+    scale_linetype_manual(values = c(Base = "dashed", `Fine-tuned` = "solid"),
+                          name = NULL) +
+    scale_shape_manual(values = c(Base = 1, `Fine-tuned` = 16), name = NULL) +
+    scale_y_continuous(limits = c(0, 100)) +
+    facet_grid(source ~ size,
+               labeller = labeller(source = \(x) paste("Train:", x))) +
+    labs(x = "Training stage", y = "Accuracy (%)", title = title) +
+    theme_minimal(base_size = 11) +
+    theme(axis.text.x = element_text(angle = 35, hjust = 1),
+          legend.position = "bottom",
+          strip.text = element_text(face = "bold"))
+}
+```
+
+```{r stage-ba-plots, results = "asis", fig.width = 9, fig.height = 8}
+for (t in levels(droplevels(acc_stage_ba$target))) {
+  cat("\n\n### Test: ", t, "\n\n")
+  p <- plot_stage_ba(filter(acc_stage_ba, target == t), paste("Test:", t))
+  print(p)
+  if (isTRUE(params$save_png)) {
+    ggsave(file.path("figures", paste0("stages_ba_test_", t, ".png")), p,
+           width = 9, height = 8, dpi = 300, bg = "white")
+  }
+  cat("\n\n")
+}
+```
+
 ## Explicit vs. implicit probe
 
 Mean gain on fb and antagonist, split by how the final question is worded
