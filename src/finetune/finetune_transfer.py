@@ -194,6 +194,19 @@ def train_lora(base, enc, train_items, args, seed):
 # ---------------------------------------------------------------- main
 
 def resolve_revision(model_path, revision):
+    if revision == "last-stage2":
+        # Highest-step stage-2 branch (stage-2 ingredients each restart their
+        # step count, so this is the last checkpoint of the longest ingredient).
+        import re
+        from huggingface_hub import list_repo_refs
+        refs = list_repo_refs(model_path)
+        names = [b.name for b in refs.branches] + [t.name for t in refs.tags]
+        stage2 = [n for n in names if "stage2" in n and re.search(r"step(\d+)", n)]
+        if not stage2:
+            raise ValueError(f"No stage2 checkpoints found for {model_path}")
+        last = max(stage2, key=lambda n: int(re.search(r"step(\d+)", n).group(1)))
+        print(f"  Last stage2 checkpoint for {model_path}: {last}")
+        return last
     if revision != "last-stage1":
         return revision
     # Reuse the exact selection used for the final-checkpoint eval runs.
@@ -209,7 +222,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--revision", default="main",
-                    help="'main' (final), 'last-stage1', or any HF branch name")
+                    help="'main' (final), 'last-stage1', 'last-stage2', "
+                         "or any HF branch name")
     ap.add_argument("--sources", nargs="+", default=TRAIN_SOURCES)
     ap.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
     ap.add_argument("--n_folds", type=int, default=4)
