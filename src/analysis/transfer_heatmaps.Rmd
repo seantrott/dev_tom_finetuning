@@ -54,15 +54,34 @@ if (length(run_dirs) == 0) {
   stop("No ft_*.csv files found under ", normalizePath(results_dir))
 }
 
+stage_levels <- c("Stage 1", "Stage 2", "Pretrained", "SFT", "DPO", "Instruct")
+
+# Short, readable label for each checkpoint, e.g. "13B Stage 1", "7B SFT".
+# Falls back to "<model> @ <revision>" for anything that doesn't match.
+checkpoint_info <- function(model_name, revision) {
+  size <- str_extract(model_name, "\\d+B")
+  stage <- case_when(
+    str_detect(model_name, "-Instruct$") ~ "Instruct",
+    str_detect(model_name, "-DPO$") ~ "DPO",
+    str_detect(model_name, "-SFT$") ~ "SFT",
+    str_detect(revision, "^stage1") ~ "Stage 1",
+    str_detect(revision, "^stage2") ~ "Stage 2",
+    revision == "main" ~ "Pretrained",
+    TRUE ~ NA_character_
+  )
+  label <- if (!is.na(size) && !is.na(stage)) paste(size, stage) else
+    paste0(model_name, " @ ", revision)
+  list(size = size, stage = stage, label = label)
+}
+
 read_run <- function(dir) {
   files <- list.files(dir, pattern = "^ft_.*\\.csv$", full.names = TRUE)
-  revision <- basename(dir)
-  model <- basename(dirname(dir))
+  info <- checkpoint_info(basename(dirname(dir)), basename(dir))
   map_dfr(files, \(f) read_csv(f, show_col_types = FALSE,
                                col_types = cols(question_id = col_double(),
                                                 .default = col_guess()))) |>
     select(-any_of(c("model", "revision"))) |>
-    mutate(model = paste0(model, " @ ", if_else(revision == "main", "final", revision)))
+    mutate(model = info$label, size = info$size, stage = info$stage)
 }
 
 log_scale <- if (isTRUE(params$use_log2)) log(2) else 1
@@ -88,6 +107,15 @@ scores <- map_dfr(run_dirs, read_run) |>
 
 condition_levels <- c("False Belief", "True Belief", unname(question_labels))
 scores <- mutate(scores, condition = factor(condition, levels = condition_levels))
+
+# Checkpoint order: by model size, then training stage
+model_info <- scores |>
+  distinct(model, size, stage) |>
+  mutate(size_num = as.numeric(str_remove(size, "B")),
+         stage_num = match(stage, stage_levels)) |>
+  arrange(size_num, stage_num, model)
+model_order <- model_info$model
+sizes <- unique(na.omit(model_info$size))
 
 # Per-item values averaged over seeds (used by the item-level plots)
 items <- scores |>
@@ -156,10 +184,162 @@ safe_name <- function(m) str_replace_all(m, "[^A-Za-z0-9._-]+", "_")
 if (isTRUE(params$save_png)) dir.create("figures", showWarnings = FALSE)
 ```
 
+## Summary figure: accuracy by training condition
+
+Accuracy on fb and antagonist, by condition, for the base model and after
+fine-tuning on each task. One figure per model size.
+Small faint points are individual checkpoints (training stages), each averaged
+over seeds. Large points are the mean across those checkpoints, with ±1 SE
+across checkpoints.
+
+```{r summary-data}
+condition_colors <- c("False Belief" = "#D95F02", "True Belief" = "#1B9E77",
+                      "Original location" = "#D95F02", "Final location" = "#1B9E77",
+                      "Who placed" = "#7570B3", "Who moved" = "#999999")
+train_levels <- c("None (base)", "FB", "Antagonist", "Agent identity")
+train_labels <- c(fb = "FB", antagonist = "Antagonist", attn_agent = "Agent identity")
+
+# Fine-tuned accuracy, per seed
+summ_ft <- scores |>
+  filter(target %in% c("fb", "antagonist")) |>
+  group_by(model, seed, source, target, condition) |>
+  summarise(acc = 100 * mean(score > 0), .groups = "drop") |>
+  mutate(training = unname(train_labels[as.character(source)])) |>
+  select(-source)
+
+# Base accuracy (one value per item; the same whichever task was trained on)
+summ_base <- scores |>
+  filter(target %in% c("fb", "antagonist")) |>
+  distinct(model, target, item_id, condition, base_score) |>
+  group_by(model, target, condition) |>
+  summarise(acc = 100 * mean(base_score > 0), .groups = "drop") |>
+  mutate(seed = NA, training = "None (base)")
+
+summ <- bind_rows(summ_ft, summ_base) |>
+  group_by(model, training, target, condition) |>
+  summarise(se = sd(acc) / sqrt(sum(!is.na(acc))), acc = mean(acc),
+            .groups = "drop") |>
+  mutate(se = replace_na(se, 0),
+         size = str_extract(model, "\\d+B"),
+         training = factor(training, levels = train_levels),
+         target = factor(target, levels = c("fb", "antagonist"),
+                         labels = c("Test: FB", "Test: Antagonist")))
+
+# One point per checkpoint, and the mean across checkpoints of each size
+summ_mean <- summ |>
+  group_by(size, training, target, condition) |>
+  summarise(n_ckpt = n(), se = sd(acc) / sqrt(n()), acc = mean(acc),
+            .groups = "drop") |>
+  mutate(se = replace_na(se, 0))
+
+plot_summary <- function(sz) {
+  pts <- filter(summ, size == sz)
+  means <- filter(summ_mean, size == sz)
+  n_ckpt <- n_distinct(pts$model)
+  dodge <- position_dodge(width = 0.5)
+  ggplot(means, aes(x = training, y = acc, color = condition)) +
+    geom_hline(yintercept = 50, linetype = "dotted", color = "grey50") +
+    geom_point(data = pts, size = 1.3, alpha = 0.35,
+               position = position_jitterdodge(jitter.width = 0.15, jitter.height = 0,
+                                               dodge.width = 0.5, seed = 1)) +
+    geom_point(position = dodge, size = 3) +
+    geom_errorbar(aes(ymin = acc - se, ymax = acc + se),
+                  position = dodge, width = 0.2) +
+    scale_color_manual(values = condition_colors, name = NULL) +
+    scale_y_continuous(limits = c(0, 100)) +
+    facet_wrap(~ target) +
+    labs(x = "Fine-tuned on", y = "Accuracy (%)",
+         title = paste0("OLMo 2 ", sz),
+         subtitle = paste0("Mean of ", n_ckpt,
+                           " checkpoints (±1 SE); faint points = individual checkpoints")) +
+    theme_bw(base_size = 12) +
+    theme(axis.text.x = element_text(angle = 20, hjust = 1),
+          legend.position = "bottom")
+}
+```
+
+```{r summary-plot, results = "asis", fig.width = 8, fig.height = 4}
+for (sz in intersect(sizes, summ$size)) {
+  cat("\n\n### OLMo 2 ", sz, "\n\n")
+  p <- plot_summary(sz)
+  print(p)
+  if (isTRUE(params$save_png)) {
+    ggsave(file.path("figures", paste0("summary_", sz, ".png")),
+           p, width = 8, height = 4, dpi = 300, bg = "white")
+  }
+  cat("\n\n")
+}
+```
+
+## Trade-off: change on fb vs. change on antagonist
+
+Each training condition as two numbers: the change in accuracy on **fb** (x)
+and on **antagonist** (y), relative to the base model, using False Belief items
+only. Points in the top-left or bottom-right helped one task at the expense of
+the other. Large points are the mean across checkpoints (±1 SE in both
+directions); faint points are individual checkpoints. One panel per model size.
+
+```{r tradeoff-data}
+tradeoff_ckpt <- summ |>
+  filter(condition == "False Belief") |>
+  select(model, size, training, target, acc) |>
+  group_by(model, size, target) |>
+  mutate(delta = acc - acc[training == "None (base)"]) |>
+  ungroup() |>
+  filter(training != "None (base)") |>
+  select(-acc) |>
+  pivot_wider(names_from = target, values_from = delta) |>
+  rename(d_fb = `Test: FB`, d_ant = `Test: Antagonist`) |>
+  mutate(size = factor(size, levels = sizes))
+
+tradeoff_mean <- tradeoff_ckpt |>
+  group_by(size, training) |>
+  summarise(n = n(),
+            se_fb = sd(d_fb) / sqrt(n), d_fb = mean(d_fb),
+            se_ant = sd(d_ant) / sqrt(n), d_ant = mean(d_ant),
+            .groups = "drop") |>
+  mutate(across(c(se_fb, se_ant), \(x) replace_na(x, 0)))
+
+training_colors <- c("FB" = "#D95F02", "Antagonist" = "#7570B3",
+                     "Agent identity" = "#1B9E77")
+```
+
+```{r tradeoff-plot, fig.width = 4.5 * length(sizes) + 1.5, fig.height = 5}
+p_tradeoff <- ggplot(tradeoff_mean, aes(x = d_fb, y = d_ant, color = training)) +
+  geom_hline(yintercept = 0, color = "grey50") +
+  geom_vline(xintercept = 0, color = "grey50") +
+  geom_point(data = tradeoff_ckpt, size = 1.5, alpha = 0.35) +
+  geom_errorbar(aes(ymin = d_ant - se_ant, ymax = d_ant + se_ant), width = 0) +
+  geom_errorbarh(aes(xmin = d_fb - se_fb, xmax = d_fb + se_fb), height = 0) +
+  geom_point(size = 3.5) +
+  scale_color_manual(values = training_colors, name = "Fine-tuned on") +
+  scale_x_continuous(limits = c(-100, 100)) +
+  scale_y_continuous(limits = c(-100, 100)) +
+  coord_fixed() +
+  facet_wrap(~ size, labeller = labeller(size = \(x) paste("OLMo 2", x))) +
+  labs(x = "Δ accuracy on fb (pp, False Belief items)",
+       y = "Δ accuracy on antagonist (pp, False Belief items)") +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "bottom")
+p_tradeoff
+if (isTRUE(params$save_png)) {
+  ggsave(file.path("figures", "tradeoff.png"), p_tradeoff,
+         width = 4.5 * length(sizes) + 1.5, height = 5, dpi = 300, bg = "white")
+}
+```
+
+```{r tradeoff-table}
+tradeoff_mean |>
+  transmute(Size = size, `Fine-tuned on` = training,
+            `Δ fb (pp)` = sprintf("%+.0f (%.0f)", d_fb, se_fb),
+            `Δ antagonist (pp)` = sprintf("%+.0f (%.0f)", d_ant, se_ant)) |>
+  knitr::kable(caption = "Mean change from base, False Belief items (SE across checkpoints)")
+```
+
 ## Heatmaps by model
 
 ```{r heatmaps, results = "asis"}
-for (m in unique(cells$model)) {
+for (m in intersect(model_order, cells$model)) {
   cat("\n\n### ", m, "\n\n")
   p <- plot_matrix(filter(cells, model == m), m)
   print(p)
@@ -175,18 +355,19 @@ for (m in unique(cells$model)) {
 
 Shared color scale, so cells can be compared across models and checkpoints.
 
-```{r all-models, fig.width = 10, fig.height = 5}
-lim_all <- max(abs(cells$mean), na.rm = TRUE)
-diag_all <- filter(cells, as.character(source) == as.character(target))
+```{r all-models, fig.width = 14, fig.height = 2.8 * length(sizes) + 1}
+cells_all <- mutate(cells, model = factor(model, levels = model_order))
+lim_all <- max(abs(cells_all$mean), na.rm = TRUE)
+diag_all <- filter(cells_all, as.character(source) == as.character(target))
 
-p_all <- ggplot(cells, aes(x = target, y = fct_rev(source), fill = mean)) +
+p_all <- ggplot(cells_all, aes(x = target, y = fct_rev(source), fill = mean)) +
   geom_tile(color = "white", linewidth = 0.4) +
   geom_tile(data = diag_all, fill = NA, color = "black", linewidth = 0.7) +
   geom_text(aes(label = sprintf("%.1f", mean)), size = 2.8) +
   scale_fill_gradient2(low = "#B2182B", mid = "#F7F7F7", high = "#2166AC",
                        midpoint = 0, limits = c(-lim_all, lim_all),
                        name = "Δ log-odds\ncorrect") +
-  facet_wrap(~ model) +
+  facet_wrap(~ model, ncol = length(stage_levels)) +
   labs(x = "Test task", y = "Train task") +
   coord_fixed() +
   theme_minimal(base_size = 11) +
@@ -195,7 +376,7 @@ p_all <- ggplot(cells, aes(x = target, y = fct_rev(source), fill = mean)) +
 p_all
 if (isTRUE(params$save_png)) {
   ggsave(file.path("figures", "transfer_all_models.png"), p_all,
-         width = 10, height = 5, dpi = 300, bg = "white")
+         width = 14, height = 2.8 * length(sizes) + 1, dpi = 300, bg = "white")
 }
 ```
 
@@ -244,7 +425,7 @@ plot_condition <- function(d, title) {
 ```
 
 ```{r condition-plots, results = "asis", fig.width = 11, fig.height = 7}
-for (m in unique(by_condition$model)) {
+for (m in intersect(model_order, by_condition$model)) {
   cat("\n\n### ", m, "\n\n")
   p <- plot_condition(filter(by_condition, model == m), m)
   print(p)
@@ -277,7 +458,7 @@ attn_sum <- scores |>
 ```
 
 ```{r attn-passage-plots, results = "asis", fig.width = 9, fig.height = 7}
-for (m in unique(attn_sum$model)) {
+for (m in intersect(model_order, attn_sum$model)) {
   cat("\n\n### ", m, "\n\n")
   p <- filter(attn_sum, model == m) |>
     ggplot(aes(x = condition, y = mean, fill = passage)) +
@@ -335,7 +516,7 @@ plot_accuracy <- function(d, title) {
 ```
 
 ```{r accuracy-plots, results = "asis"}
-for (m in unique(acc_cells$model)) {
+for (m in intersect(model_order, acc_cells$model)) {
   cat("\n\n### ", m, "\n\n")
   p <- plot_accuracy(filter(acc_cells, model == m), m)
   print(p)
@@ -384,7 +565,7 @@ plot_acc_condition <- function(d, title) {
 ```
 
 ```{r acc-condition-plots, results = "asis", fig.width = 11, fig.height = 7}
-for (m in unique(acc_by_condition$model)) {
+for (m in intersect(model_order, acc_by_condition$model)) {
   cat("\n\n### ", m, "\n\n")
   p <- plot_acc_condition(filter(acc_by_condition, model == m), m)
   print(p)
@@ -406,26 +587,11 @@ checkpoint), Pretrained (final base model), then the SFT, DPO and Instruct
 models.
 
 ```{r stage-data}
-stage_levels <- c("Stage 1", "Stage 2", "Pretrained", "SFT", "DPO", "Instruct")
-
 acc_by_stage <- acc_by_condition |>
-  mutate(
-    model_name = str_remove(model, " @ .*$"),
-    revision = str_remove(model, "^.* @ "),
-    size = str_extract(model_name, "\\d+B"),
-    stage = case_when(
-      str_detect(model_name, "-Instruct$") ~ "Instruct",
-      str_detect(model_name, "-DPO$") ~ "DPO",
-      str_detect(model_name, "-SFT$") ~ "SFT",
-      str_detect(revision, "^stage1") ~ "Stage 1",
-      str_detect(revision, "^stage2") ~ "Stage 2",
-      revision == "final" ~ "Pretrained",
-      TRUE ~ NA_character_
-    )
-  ) |>
+  left_join(select(model_info, model, size, stage), by = "model") |>
   filter(!is.na(stage), !is.na(size)) |>
   mutate(stage = factor(stage, levels = stage_levels),
-         size = factor(size, levels = str_sort(unique(size), numeric = TRUE)))
+         size = factor(size, levels = sizes))
 
 plot_stage <- function(d, title) {
   ggplot(d, aes(x = stage, y = mean, color = condition, group = condition)) +
@@ -542,7 +708,7 @@ plot_cue <- function(d, title) {
 ```
 
 ```{r cue-plots, results = "asis", fig.width = 7, fig.height = 7}
-for (m in unique(by_cue$model)) {
+for (m in intersect(model_order, by_cue$model)) {
   cat("\n\n### ", m, "\n\n")
   p <- plot_cue(filter(by_cue, model == m), m)
   print(p)
@@ -579,7 +745,7 @@ plot_items <- function(d, title) {
 ```
 
 ```{r item-plots, results = "asis", fig.width = 11, fig.height = 8}
-for (m in unique(items$model)) {
+for (m in intersect(model_order, items$model)) {
   cat("\n\n### ", m, "\n\n")
   p <- plot_items(filter(items, model == m), m)
   print(p)

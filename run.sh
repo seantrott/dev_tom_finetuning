@@ -18,12 +18,6 @@ set -e
 #   last-stage2  highest-step stage-2 checkpoint
 #   main         the released model
 RUNS=(
-  "allenai/OLMo-2-1124-13B-Instruct main"
-  "allenai/OLMo-2-1124-7B last-stage1"
-  "allenai/OLMo-2-1124-7B last-stage2"
-  "allenai/OLMo-2-1124-7B main"
-  "allenai/OLMo-2-1124-7B-SFT main"
-  "allenai/OLMo-2-1124-7B-DPO main"
   "allenai/OLMo-2-1124-7B-Instruct main"
 )
 
