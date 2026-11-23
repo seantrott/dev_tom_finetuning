@@ -271,6 +271,36 @@ for (sz in intersect(sizes, summ$size)) {
 }
 ```
 
+### All sizes in one figure
+
+```{r summary-combined, fig.width = 8, fig.height = 2.6 * length(sizes) + 1}
+pts_all <- mutate(summ, size = factor(size, levels = sizes))
+means_all <- mutate(summ_mean, size = factor(size, levels = sizes))
+dodge <- position_dodge(width = 0.5)
+
+p_summary_all <- ggplot(means_all, aes(x = training, y = acc, color = condition)) +
+  geom_hline(yintercept = 50, linetype = "dotted", color = "grey50") +
+  geom_point(data = pts_all, size = 1.3, alpha = 0.35,
+             position = position_jitterdodge(jitter.width = 0.15, jitter.height = 0,
+                                             dodge.width = 0.5, seed = 1)) +
+  geom_point(position = dodge, size = 3) +
+  geom_errorbar(aes(ymin = acc - se, ymax = acc + se),
+                position = dodge, width = 0.2) +
+  scale_color_manual(values = condition_colors, name = NULL) +
+  scale_y_continuous(limits = c(0, 100)) +
+  facet_grid(size ~ target, labeller = labeller(size = \(x) paste("OLMo 2", x))) +
+  labs(x = "Fine-tuned on", y = "Accuracy (%)",
+       subtitle = "Mean across checkpoints (±1 SE); faint points = individual checkpoints") +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1),
+        legend.position = "bottom")
+p_summary_all
+if (isTRUE(params$save_png)) {
+  ggsave(file.path("figures", "summary_all_sizes.png"), p_summary_all,
+         width = 8, height = 2.6 * length(sizes) + 1, dpi = 300, bg = "white")
+}
+```
+
 ## Trade-off: change on fb vs. change on antagonist
 
 Each training condition as two numbers: the change in accuracy on **fb** (x)
